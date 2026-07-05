@@ -3837,8 +3837,167 @@
             iv: data.iv
           }
         };
+      },
+
+      // ==================== 配置读取（app_config 表） ====================
+      // 读取单个配置项
+      async fetchConfig(key) {
+        if (!this.client) {
+          if (!this.init()) return null;
+        }
+        try {
+          const { data, error } = await this.client
+            .from('app_config')
+            .select('value')
+            .eq('key', key)
+            .limit(1);
+          if (error) {
+            console.warn('读取配置失败:', key, error.message);
+            return null;
+          }
+          return (data && data.length > 0) ? data[0].value : null;
+        } catch (e) {
+          console.warn('读取配置异常:', key, e.message);
+          return null;
+        }
+      },
+
+      // 读取所有配置
+      async fetchAllConfig() {
+        if (!this.client) {
+          if (!this.init()) return {};
+        }
+        try {
+          const { data, error } = await this.client
+            .from('app_config')
+            .select('key, value');
+          if (error) {
+            console.warn('读取所有配置失败:', error.message);
+            return {};
+          }
+          const result = {};
+          if (data) {
+            data.forEach(row => { result[row.key] = row.value; });
+          }
+          return result;
+        } catch (e) {
+          console.warn('读取所有配置异常:', e.message);
+          return {};
+        }
       }
     };
+
+    // ==================== 应用配置模块（AppConfig） ====================
+    // 三级降级：内存缓存 → localStorage → Supabase
+    const AppConfig = {
+      _cache: {},
+      _cacheTime: 0,
+      _CACHE_DURATION: 3600000, // 1小时
+
+      // 获取单个配置项
+      async get(key, defaultValue = null) {
+        // 1. 内存缓存
+        if (this._cache[key] !== undefined) {
+          return this._cache[key];
+        }
+
+        // 2. localStorage 缓存
+        const localKey = 'canoe_app_config_' + key;
+        const localRaw = localStorage.getItem(localKey);
+        if (localRaw) {
+          try {
+            const localData = JSON.parse(localRaw);
+            // localStorage 缓存有效期 1 小时
+            if (localData.timestamp && (Date.now() - localData.timestamp < this._CACHE_DURATION)) {
+              this._cache[key] = localData.value;
+              return localData.value;
+            }
+          } catch (e) {
+            localStorage.removeItem(localKey);
+          }
+        }
+
+        // 3. 从 Supabase 加载
+        if (typeof CloudSync !== 'undefined' && CloudSync.isConfigured()) {
+          try {
+            const value = await CloudSync.fetchConfig(key);
+            if (value !== null && value !== undefined) {
+              this._cache[key] = value;
+              localStorage.setItem(localKey, JSON.stringify({
+                value: value,
+                timestamp: Date.now()
+              }));
+              return value;
+            }
+          } catch (e) {
+            console.warn('从 Supabase 获取配置失败，使用默认值:', key, e.message);
+          }
+        }
+
+        return defaultValue;
+      },
+
+      // 一次性加载所有配置（启动时调用）
+      async loadAll() {
+        // 先从 localStorage 恢复
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith('canoe_app_config_')) {
+              const raw = localStorage.getItem(k);
+              if (raw) {
+                const data = JSON.parse(raw);
+                const key = k.replace('canoe_app_config_', '');
+                this._cache[key] = data.value;
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('从 localStorage 加载配置失败:', e.message);
+        }
+
+        // 从 Supabase 刷新
+        if (typeof CloudSync !== 'undefined' && CloudSync.isConfigured()) {
+          try {
+            const allConfig = await CloudSync.fetchAllConfig();
+            for (const key in allConfig) {
+              this._cache[key] = allConfig[key];
+              localStorage.setItem('canoe_app_config_' + key, JSON.stringify({
+                value: allConfig[key],
+                timestamp: Date.now()
+              }));
+            }
+            this._cacheTime = Date.now();
+            console.log('[AppConfig] 配置加载完成:', Object.keys(this._cache));
+          } catch (e) {
+            console.warn('从 Supabase 加载所有配置失败:', e.message);
+          }
+        }
+      },
+
+      // 清除缓存
+      clearCache() {
+        this._cache = {};
+        this._cacheTime = 0;
+        try {
+          for (let i = localStorage.length - 1; i >= 0; i--) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith('canoe_app_config_')) {
+              localStorage.removeItem(k);
+            }
+          }
+        } catch (e) {
+          console.warn('清除配置缓存失败:', e.message);
+        }
+      }
+    };
+
+    // 页面加载时预加载配置
+    document.addEventListener('DOMContentLoaded', function() {
+      if (typeof AppConfig !== 'undefined') {
+        AppConfig.loadAll().catch(e => console.warn('配置预加载失败:', e.message));
+      }
+    });
 
     // ==================== 用户认证模块（UserAuth） ====================
     const UserAuth = {
@@ -5513,16 +5672,22 @@
     }
 
     // ==================== 豆包 API 调用模块 ====================
-    const DOUBAO_API_KEY = 'ark-5330ad05-9d94-4b02-81a4-f890e9eaef08-d42be';
+    // API 密钥从 Supabase app_config 表动态获取（见 AppConfig 模块）
     const DOUBAO_API_URL = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
     const DOUBAO_MODEL = 'doubao-1-5-lite-32k-250115';
 
     async function callDoubao(messages) {
+      // 动态获取密钥：内存缓存 → localStorage → Supabase
+      const apiKey = await AppConfig.get('doubao_api_key');
+      if (!apiKey) {
+        throw new Error('豆包API密钥未配置（请在 Supabase app_config 表中设置 doubao_api_key）');
+      }
+
       const response = await fetch(DOUBAO_API_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${DOUBAO_API_KEY}`
+          'Authorization': `Bearer ${apiKey}`
         },
         body: JSON.stringify({
           model: DOUBAO_MODEL,
@@ -7176,12 +7341,18 @@
 
     async function tryDoubaoImage(keyword) {
       try {
+        // 动态获取密钥
+        const apiKey = await AppConfig.get('doubao_api_key');
+        if (!apiKey) {
+          throw new Error('豆包API密钥未配置');
+        }
+
         const prompt = `${keyword}主题，柔和治愈系插画，温暖色调，简约风格，水彩质感，适合青少年`;
         const response = await fetch('https://ark.cn-beijing.volces.com/api/v3/images/generations', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${DOUBAO_API_KEY}`
+            'Authorization': `Bearer ${apiKey}`
           },
           body: JSON.stringify({
             model: DOUBAO_IMAGE_MODEL,
