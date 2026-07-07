@@ -3077,7 +3077,7 @@
       }
     }
   </style>
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+  <script src="https://cdn.bootcdn.net/ajax/libs/supabase/2.43.4/supabase.min.js"></script>
 </head>
 <body>
   <!-- 启动页 -->
@@ -3479,9 +3479,28 @@
         const encryptedJson = localStorage.getItem('canoe_vault_data');
         if (!encryptedJson) return { messages: [], settings: {}, wallPosts: [], wallLikes: [], calendarEvents: [], moodRecords: {}, checkIns: {} };
 
-        const bundle = JSON.parse(encryptedJson);
-        const data = await CryptoVault.decrypt(bundle, password);
-        
+        let bundle;
+        try {
+          bundle = JSON.parse(encryptedJson);
+        } catch (e) {
+          console.warn('[CryptoVault] 本地数据不是有效 JSON，重置为空');
+          return { messages: [], settings: {}, wallPosts: [], wallLikes: [], calendarEvents: [], moodRecords: {}, checkIns: {} };
+        }
+
+        let data;
+        try {
+          // 兼容旧数据/明文数据：如果没有 salt/iv/data 字段，直接当作明文对象使用
+          if (!bundle.salt || !bundle.iv || !bundle.data) {
+            console.warn('[CryptoVault] 检测到非加密格式数据，兼容读取');
+            data = bundle;
+          } else {
+            data = await CryptoVault.decrypt(bundle, password);
+          }
+        } catch (e) {
+          console.warn('[CryptoVault] 解密失败，重置为空:', e.message);
+          return { messages: [], settings: {}, wallPosts: [], wallLikes: [], calendarEvents: [], moodRecords: {}, checkIns: {} };
+        }
+
         // 兼容旧数据结构
         if (!data.wallPosts) data.wallPosts = [];
         if (!data.wallLikes) data.wallLikes = [];
@@ -3490,7 +3509,7 @@
         if (!data.calendarEvents) data.calendarEvents = [];
         if (!data.moodRecords) data.moodRecords = {};
         if (!data.checkIns) data.checkIns = {};
-        
+
         return data;
       },
 
@@ -3892,12 +3911,12 @@
     const AppConfig = {
       _cache: {},
       _cacheTime: 0,
-      _CACHE_DURATION: 3600000, // 1小时
+      _CACHE_DURATION: 3600000,
 
       // 获取单个配置项
       async get(key, defaultValue = null) {
         // 1. 内存缓存
-        if (this._cache[key] !== undefined) {
+        if (this._cache[key] !== undefined && this._cache[key] !== null) {
           return this._cache[key];
         }
 
@@ -3907,10 +3926,11 @@
         if (localRaw) {
           try {
             const localData = JSON.parse(localRaw);
-            // localStorage 缓存有效期 1 小时
             if (localData.timestamp && (Date.now() - localData.timestamp < this._CACHE_DURATION)) {
-              this._cache[key] = localData.value;
-              return localData.value;
+              if (localData.value !== null && localData.value !== undefined && localData.value !== '') {
+                this._cache[key] = localData.value;
+                return localData.value;
+              }
             }
           } catch (e) {
             localStorage.removeItem(localKey);
@@ -3918,19 +3938,26 @@
         }
 
         // 3. 从 Supabase 加载
-        if (typeof CloudSync !== 'undefined' && CloudSync.isConfigured()) {
-          try {
-            const value = await CloudSync.fetchConfig(key);
-            if (value !== null && value !== undefined) {
-              this._cache[key] = value;
-              localStorage.setItem(localKey, JSON.stringify({
-                value: value,
-                timestamp: Date.now()
-              }));
-              return value;
+        if (typeof CloudSync !== 'undefined') {
+          if (!CloudSync.client) CloudSync.init();
+          if (CloudSync.client) {
+            try {
+              console.log('[AppConfig] 尝试从 Supabase 读取:', key);
+              const value = await CloudSync.fetchConfig(key);
+              console.log('[AppConfig] Supabase 返回值:', key, value === null ? 'null' : '长度' + String(value).length);
+              if (value !== null && value !== undefined && value !== '') {
+                this._cache[key] = value;
+                localStorage.setItem(localKey, JSON.stringify({
+                  value: value,
+                  timestamp: Date.now()
+                }));
+                return value;
+              }
+            } catch (e) {
+              console.warn('从 Supabase 获取配置失败，使用默认值:', key, e.message);
             }
-          } catch (e) {
-            console.warn('从 Supabase 获取配置失败，使用默认值:', key, e.message);
+          } else {
+            console.warn('[AppConfig] CloudSync.client 未初始化，无法读取 Supabase');
           }
         }
 
@@ -3957,20 +3984,23 @@
         }
 
         // 从 Supabase 刷新
-        if (typeof CloudSync !== 'undefined' && CloudSync.isConfigured()) {
-          try {
-            const allConfig = await CloudSync.fetchAllConfig();
-            for (const key in allConfig) {
-              this._cache[key] = allConfig[key];
-              localStorage.setItem('canoe_app_config_' + key, JSON.stringify({
-                value: allConfig[key],
-                timestamp: Date.now()
-              }));
+        if (typeof CloudSync !== 'undefined') {
+          if (!CloudSync.client) CloudSync.init();
+          if (CloudSync.client) {
+            try {
+              const allConfig = await CloudSync.fetchAllConfig();
+              for (const key in allConfig) {
+                this._cache[key] = allConfig[key];
+                localStorage.setItem('canoe_app_config_' + key, JSON.stringify({
+                  value: allConfig[key],
+                  timestamp: Date.now()
+                }));
+              }
+              this._cacheTime = Date.now();
+              console.log('[AppConfig] 配置加载完成:', Object.keys(this._cache));
+            } catch (e) {
+              console.warn('从 Supabase 加载所有配置失败:', e.message);
             }
-            this._cacheTime = Date.now();
-            console.log('[AppConfig] 配置加载完成:', Object.keys(this._cache));
-          } catch (e) {
-            console.warn('从 Supabase 加载所有配置失败:', e.message);
           }
         }
       },
@@ -5671,26 +5701,25 @@
       return responses[Math.floor(Math.random() * responses.length)];
     }
 
-    // ==================== 豆包 API 调用模块 ====================
+    // ==================== 阿里通义千问 API 调用模块 ====================
     // API 密钥从 Supabase app_config 表动态获取（见 AppConfig 模块）
-    const DOUBAO_API_URL = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
-    const DOUBAO_MODEL = 'doubao-1-5-lite-32k-250115';
+    const ALIBABA_API_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
+    const ALIBABA_MODEL = 'qwen-plus';
 
-    async function callDoubao(messages) {
-      // 动态获取密钥：内存缓存 → localStorage → Supabase
-      const apiKey = await AppConfig.get('doubao_api_key');
+    async function callAlibaba(messages) {
+      const apiKey = await AppConfig.get('alibaba_api_key');
       if (!apiKey) {
-        throw new Error('豆包API密钥未配置（请在 Supabase app_config 表中设置 doubao_api_key）');
+        throw new Error('阿里API密钥未配置（请在 Supabase app_config 表中设置 alibaba_api_key）');
       }
 
-      const response = await fetch(DOUBAO_API_URL, {
+      const response = await fetch(ALIBABA_API_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${apiKey}`
         },
         body: JSON.stringify({
-          model: DOUBAO_MODEL,
+          model: ALIBABA_MODEL,
           messages: messages,
           temperature: 0.8,
           max_tokens: 500
@@ -5705,53 +5734,53 @@
       return data.choices[0].message.content;
     }
 
-    // 豆包对话
-    async function tryDoubaoChat(message, emotion) {
+    // 阿里对话
+    async function tryAlibabaChat(message, emotion) {
       try {
         const systemPrompt = getSystemPrompt(emotion);
-        const result = await callDoubao([
+        const result = await callAlibaba([
           { role: 'system', content: systemPrompt },
           { role: 'user', content: message }
         ]);
         if (result && result.trim()) {
-          console.log('[豆包对话] 成功');
+          console.log('[阿里对话] 成功');
           return result.trim();
         }
         return null;
       } catch (error) {
-        console.warn('[豆包对话] 失败:', error.message);
+        console.warn('[阿里对话] 失败:', error.message);
         return null;
       }
     }
 
-    // 豆包话术生成
-    async function tryDoubaoEncouragement(scene) {
+    // 阿里话术生成
+    async function tryAlibabaEncouragement(scene) {
       try {
         const prompt = `你是一个温暖的高年级学长/学姐，为即将参加考试的学弟学妹生成一句简短的鼓励话（50字以内），场景：${scene}。语气要自然亲切，像朋友聊天，不要说教。只返回一句话，不要其他内容。`;
-        const result = await callDoubao([{ role: 'user', content: prompt }]);
+        const result = await callAlibaba([{ role: 'user', content: prompt }]);
         if (result && result.trim()) {
-          console.log('[豆包话术] 成功');
+          console.log('[阿里话术] 成功');
           return result.trim();
         }
         return null;
       } catch (error) {
-        console.warn('[豆包话术] 失败:', error.message);
+        console.warn('[阿里话术] 失败:', error.message);
         return null;
       }
     }
 
-    // 豆包明信片短句
-    async function tryDoubaoText(keyword) {
+    // 阿里明信片短句
+    async function tryAlibabaText(keyword) {
       try {
         const prompt = `请根据关键词"${keyword}"生成一句温暖治愈的短句（30字以内），适合写在明信片上。只返回短句，不要其他内容。`;
-        const result = await callDoubao([{ role: 'user', content: prompt }]);
+        const result = await callAlibaba([{ role: 'user', content: prompt }]);
         if (result && result.trim()) {
-          console.log('[豆包短句] 成功');
+          console.log('[阿里短句] 成功');
           return result.trim();
         }
         return null;
       } catch (error) {
-        console.warn('[豆包短句] 失败:', error.message);
+        console.warn('[阿里短句] 失败:', error.message);
         return null;
       }
     }
@@ -5776,15 +5805,15 @@
       }
     }
 
-    // 统一入口：豆包 API -> TRAE 原生 AI -> 降级
+    // 统一入口：TRAE 原生 AI -> 阿里千问 -> 本地降级
     async function tryCallAPI(message, emotion) {
-      // 1. 先尝试豆包 API
-      const doubaoResult = await tryDoubaoChat(message, emotion);
-      if (doubaoResult) return doubaoResult;
-
-      // 2. 再尝试 TRAE 原生 AI
+      // 1. 先尝试 TRAE 原生 AI
       const traeResult = await tryTRAEChat(message, emotion);
       if (traeResult) return traeResult;
+
+      // 2. 再尝试阿里千问 API
+      const alibabaResult = await tryAlibabaChat(message, emotion);
+      if (alibabaResult) return alibabaResult;
 
       return null;
     }
@@ -6428,9 +6457,9 @@
       resultContainer.innerHTML = '<div class="loading">正在生成话术...</div>';
       resultContainer.style.display = 'block';
 
-      // 尝试 豆包 -> TRAE -> 本地兜底
-      let text = await tryDoubaoEncouragement(selectedScene);
-      if (!text) text = await tryTRAEEncouragement(selectedScene);
+      // 尝试 TRAE -> 阿里 -> 本地兜底
+      let text = await tryTRAEEncouragement(selectedScene);
+      if (!text) text = await tryAlibabaEncouragement(selectedScene);
 
       if (!text) {
         console.log('[话术离线模式] 使用本地预设');
@@ -7313,7 +7342,8 @@
           <text x="200" y="100" text-anchor="middle" dominant-baseline="middle" font-size="24" fill="#4A4A4A">${keyword}</text>
         </svg>
       `;
-      return 'data:image/svg+xml;base64,' + btoa(svg);
+      const utf8 = unescape(encodeURIComponent(svg));
+      return 'data:image/svg+xml;base64,' + btoa(utf8);
     }
 
     // ==================== 尝试 TRAE 生成短句 ====================
@@ -7332,49 +7362,6 @@
         return null;
       } catch (error) {
         console.warn('[TRAE 短句] 失败:', error.message);
-        return null;
-      }
-    }
-
-    // ==================== 豆包文生图 ====================
-    const DOUBAO_IMAGE_MODEL = 'doubao-seedream-5-0-260128';
-
-    async function tryDoubaoImage(keyword) {
-      try {
-        // 动态获取密钥
-        const apiKey = await AppConfig.get('doubao_api_key');
-        if (!apiKey) {
-          throw new Error('豆包API密钥未配置');
-        }
-
-        const prompt = `${keyword}主题，柔和治愈系插画，温暖色调，简约风格，水彩质感，适合青少年`;
-        const response = await fetch('https://ark.cn-beijing.volces.com/api/v3/images/generations', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`
-          },
-          body: JSON.stringify({
-            model: DOUBAO_IMAGE_MODEL,
-            prompt: prompt,
-            response_format: 'url',
-            size: '2K',
-            watermark: false
-          })
-        });
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-
-        const data = await response.json();
-        if (data.data && data.data[0] && data.data[0].url) {
-          console.log('[豆包文生图] 成功');
-          return data.data[0].url;
-        }
-        return null;
-      } catch (error) {
-        console.warn('[豆包文生图] 失败:', error.message);
         return null;
       }
     }
@@ -7399,27 +7386,40 @@
       }
     }
 
-    // ==================== 尝试 Pollinations 生成图片 ====================
-    async function tryPollinationsImage(keyword) {
+    // ==================== 阿里通义万相文生图 ====================
+    async function tryAlibabaImage(keyword) {
       try {
-        const prompt = `${keyword}主题，柔和治愈系插画，温暖色调，简约风格，水彩质感，适合青少年`;
-        const encodedPrompt = encodeURIComponent(prompt);
-        const imageUrl = `${POLLINATIONS_IMAGE_URL}${encodedPrompt}&width=800&height=600&seed=-1`;
-        
-        // 测试图片是否可加载（5秒超时）
-        const img = new Image();
-        img.src = imageUrl;
-        
-        await new Promise((resolve, reject) => {
-          img.onload = resolve;
-          img.onerror = reject;
-          setTimeout(reject, 5000);
+        if (!CloudSync || !CloudSync.SUPABASE_URL) {
+          throw new Error('Supabase 未配置');
+        }
+
+        const prompt = `${keyword}主题，柔和治愈系插画，温暖色调，简约风格，水彩质感，适合青少年，竖版构图`;
+
+        const edgeFunctionUrl = CloudSync.SUPABASE_URL.replace('.supabase.co', '.functions.supabase.co') + '/alibaba-image';
+        const response = await fetch(edgeFunctionUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + (CloudSync.SUPABASE_ANON_KEY || '')
+          },
+          body: JSON.stringify({ prompt: prompt, size: '1024*1536' })
         });
 
-        console.log('[Pollinations 图片] 成功');
-        return imageUrl;
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => null);
+          console.warn('[阿里文生图] Edge Function 错误:', errorData);
+          throw new Error(`HTTP ${response.status}${errorData && errorData.error ? ': ' + errorData.error : ''}`);
+        }
+
+        const data = await response.json();
+        if (data && data.success && data.url) {
+          console.log('[阿里文生图] 成功');
+          return data.url;
+        } else {
+          throw new Error(data?.error || '生成失败');
+        }
       } catch (error) {
-        console.warn('[Pollinations 图片] 失败:', error.message);
+        console.warn('[阿里文生图] 失败:', error.message);
         return null;
       }
     }
@@ -7437,19 +7437,17 @@
       resultContainer.innerHTML = '<div class="loading">正在生成明信片...</div>';
       resultContainer.style.display = 'block';
 
-      // 短句：豆包 -> TRAE -> Pollinations -> 本地
-      let text = await tryDoubaoText(keyword);
-      if (!text) text = await tryTRAEText(keyword);
-      if (!text) text = await tryPollinationsText(keyword);
+      // 短句：TRAE -> 阿里 -> 本地
+      let text = await tryTRAEText(keyword);
+      if (!text) text = await tryAlibabaText(keyword);
       if (!text) {
         console.log('[短句离线模式] 使用本地预设');
         text = fallbackTexts[Math.floor(Math.random() * fallbackTexts.length)];
       }
 
-      // 图片：豆包 -> TRAE -> Pollinations -> SVG
-      let imageUrl = await tryDoubaoImage(keyword);
-      if (!imageUrl) imageUrl = await tryTRAEImage(keyword);
-      if (!imageUrl) imageUrl = await tryPollinationsImage(keyword);
+      // 图片：TRAE -> 阿里 -> SVG兜底
+      let imageUrl = await tryTRAEImage(keyword);
+      if (!imageUrl) imageUrl = await tryAlibabaImage(keyword);
       if (!imageUrl) {
         console.log('[图片离线模式] 使用 SVG 兜底');
         imageUrl = generateDefaultImage(keyword);
